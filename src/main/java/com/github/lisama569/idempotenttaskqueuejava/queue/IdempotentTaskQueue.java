@@ -100,6 +100,14 @@ public class IdempotentTaskQueue {
         return store.findById(id).map(TaskView::from).orElse(null);
     }
 
+    /**
+     * 标记业务副作用已执行（幂等守卫落盘点）：在存储锁内更新并触发持久化，
+     * 保证“副作用已做但 ACK 前进程被杀”在真实重启后仍不会重复执行副作用。
+     */
+    public void markSideEffectDone(TaskRecord task) {
+        store.withLock((Runnable) () -> store.markSideEffectDone(task.getId()));
+    }
+
     public Optional<TaskView> findByBusinessKey(String businessKey) {
         return store.findByBusinessKey(businessKey).map(TaskView::from);
     }

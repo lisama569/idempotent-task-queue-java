@@ -1,20 +1,22 @@
 # 幂等任务队列与消费位点管理（本地、无外部中间件）
 
-一套基于 Spring Boot 3 / Java 21 的**纯内存**幂等任务队列实现，可在本地直接运行与验证，
-不依赖 Kafka / Redis / 数据库等任何外部中间件。它解决四类问题：
+一套基于 Spring Boot 3 / Java 21 的幂等任务队列实现，可在本地直接运行与验证，
+不依赖 Kafka / Redis / 数据库等任何外部中间件。它解决五类问题：
 
 1. 同一业务键的**重复投递去重**（并发下也成立）；
 2. **失败按策略重试**，耗尽后进入可查询的终态；
 3. **消费位点单调管理**，回退被拒绝，消费重启后不重放、不丢失；
-4. **容量与速率约束**下拒绝新任务，拒绝原因与业务校验失败明确可区分。
+4. **容量与速率约束**下拒绝新任务，拒绝原因与业务校验失败明确可区分；
+5. **本地持久化与完整重启恢复**：进程彻底停掉再拉起，任务、顺序、位点、
+   去重与容量口径全部接上；写到一半被杀也能恢复成确定状态或明确拒绝启动。
 
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（15 个，含并发、重投、重试耗尽、位点回退场景）
+# 运行全部测试（22 个，含并发、重投、重试耗尽、位点回退、完整重启恢复场景）
 mvn test
 
-# 启动应用（自动启动单分区消费 worker）
+# 启动应用（自动启动单分区消费 worker，默认开启本地持久化 ./queue-data）
 mvn spring-boot:run
 ```
 
@@ -52,7 +54,7 @@ curl http://localhost:8080/api/queue/stats                 # 容量/各状态计
                                           └──重试耗尽──> FAILED_PERMANENT（终态，可查询）
   ```
 
-- 终态记录（成功/永久失败）保留在内存中：用于业务键永久去重与状态查询，
+- 终态记录（成功/永久失败）保留（内存 + 本地持久化）：用于业务键永久去重与状态查询，
   不再参与调度与容量计数。
 
 ## 3. 去重规则（Deduplication）
@@ -107,7 +109,54 @@ rejectedCapacityTotal。
 - ACK 前崩溃：任务停留在 `DELIVERING`，超过 `delivery-timeout` 后被同一任务重新领取
   （`staleDeliveries` 计数 +1，便于解释重复消费），依靠幂等守卫避免副作用重复。
 
-## 7. 配置项（application.properties）
+## 7. 本地持久化与完整重启恢复（Persistence & Recovery）
+
+默认开启（`idempotent.queue.persistence.enabled=true`），纯本地文件实现，不引入任何外部中间件。
+存储目录（默认 `./queue-data`）下只有两类文件：
+
+| 文件 | 作用 |
+|---|---|
+| `journal.log` | 追加式事件日志（JSON Lines，每行带 CRC32），每次写入后 fsync |
+| `snapshot.jsonl` | 全量状态快照（任务记录 + 位点 + 计数器），历史收拢的产物 |
+
+**写入路径**：`TaskStore`/`OffsetManager` 的每次状态变更（入队、状态迁移、幂等标记、
+位点提交、拒绝计数）在存储锁内同步追加到日志并 fsync，返回即已落盘。
+同一任务**先写终态 STATUS、再写位点 OFFSET**，这个顺序是崩溃恢复确定性的基础。
+
+**恢复规则**（进程彻底停掉后，用同一目录启动新进程/新实例即触发）：
+
+1. 先读快照（如有），再重放日志；事件应用**幂等**（全量覆盖 / 单调取大），
+   因此“快照已写、日志未重置”的压缩中断场景重放旧事件也不会矛盾；
+2. 崩溃时处于 `DELIVERING` 的任务：投递者已随进程消失，**确定性重置为 PENDING**
+   （`staleDeliveries+1`），等待重新领取，不丢；
+3. 位点滞后修复：若崩溃发生在“终态已写、位点未写”之间，恢复时把位点
+   **推进到最长终态前缀**——这些任务绝不会重跑，推进等价于补做未落盘的提交；
+4. 日志尾部撕裂写（写到一半被杀）：按 CRC 校验截断到最后一条完整记录，
+   截断落实回文件，已落盘前缀不受影响；
+5. **矛盾拒绝启动**：若发现“位点越过未终态任务”“位点超过最大任务 ID”
+   “业务键重复”等自相矛盾状态，抛 `RecoveryException` 拒绝启动，
+   日志明确指出卡在哪个任务/哪个位点，绝不悄悄糊过去。
+
+恢复过程输出 `RecoveryReport`（是否用快照、重放事件数、截断字节数、在途重置数、
+修复前后位点、判断依据 notes），启动日志可见。
+
+**重启后保持一致的口径**：各状态任务数量、按业务键查重（含终态键）、终态查询结果、
+容量占用（重启前占容量的未终态任务仍占，已结束的不再占）、消费位点、
+业务键去重、累计接受/拒绝计数。`RATE_LIMITED`/`INVALID_TASK`
+拒绝计数是运行期统计，不落盘（不影响队列语义）。
+
+**历史收拢（Compaction）**：日志超过 `compact-threshold-bytes`（默认 1MB）自动触发，
+也可由 `PersistenceManager.compactNow()` 手动触发。收拢 = 把当前全量状态写快照
+（临时文件 + fsync + 原子 rename + 目录 fsync）再重置日志；被丢弃的只是
+“已被后续状态覆盖的历史变迁”，任务记录、业务键、位点、计数器全部保留，
+因此**收拢前后语义完全一致**，收拢后新的重复投递、失败重试照常工作。
+快照原子 rename 保证压缩中途被杀只会留下可忽略的 `.tmp` 残文件（启动时自动清理）。
+
+**兼容范围**：空目录或目录不存在视为首次启动（全新队列）；
+`persistence.enabled=false` 完全退回旧版纯内存行为，存量数据/测试不受影响；
+持久化格式带版本号（snapshot HEADER `version=1`），格式演进时旧版本会明确报错而非误读。
+
+## 8. 配置项（application.properties）
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
@@ -117,8 +166,11 @@ rejectedCapacityTotal。
 | `idempotent.queue.retry-backoff-millis` | 50 | 首次失败退避基数（指数增长） |
 | `idempotent.queue.delivery-timeout-millis` | 5000 | DELIVERING 多久未 ACK 判定僵死并重投 |
 | `idempotent.queue.auto-start-worker` | true | 是否随应用启动消费 worker |
+| `idempotent.queue.persistence.enabled` | true | 是否启用本地持久化（false 退回纯内存） |
+| `idempotent.queue.persistence.dir` | ./queue-data | 本地存储目录（快照 + 日志），同目录重启即恢复 |
+| `idempotent.queue.persistence.compact-threshold-bytes` | 1048576 | 日志超过该字节数触发历史收拢 |
 
-## 8. 验证方法（测试覆盖）
+## 9. 验证方法（测试覆盖）
 
 测试均为本地内存运行，日志以 `[TEST-INPUT] / [TEST-OFFSET] / [TEST-RESULT] /
 [TEST-BASIS]` 前缀打印**输入、位点与判定依据**：
@@ -133,18 +185,38 @@ rejectedCapacityTotal。
 | `CrashRedeliveryRestartTest` | ACK 前崩溃重投副作用仅一次；消费重启从 committed+1 恢复 |
 | `ConcurrentProduceConsumeTest` | 12 生产者 × 80 键 × 3 份并发投递 + 后台消费：无丢失、无重复、位点连续 |
 | `QueueWebIntegrationTest` | 真实容器端到端：201/409/400 错误码与 stats 判定依据 |
+| `PersistenceRestartTest` | 同一存储目录重建实例模拟完整重启：已完成不重跑、未完成不丢且 FIFO 不乱、位点/各状态计数/终态查询/容量/去重口径一致；DELIVERING 在途重置；终态已写位点未写的崩溃点确定性修复；日志撕裂尾部截断；矛盾状态拒绝启动；收拢前后语义一致 |
 
 ```bash
-mvn test                                  # 全部
-mvn -Dtest=OffsetRejectTest test          # 单场景
+mvn test                                        # 全部
+mvn -Dtest=OffsetRejectTest test                # 单场景
+mvn -Dtest=PersistenceRestartTest test          # 完整重启与恢复场景
 ```
 
-## 9. 关键设计取舍
+本地手动验证完整重启：
 
-- **内存而非外部中间件**：满足本地可运行、可复现；语义正确性由单锁 + 单调位点 +
-  幂等标记保证。生产环境若需要跨进程持久化，可替换 `TaskStore`/`OffsetManager`
-  实现而不改变上层语义。
+```bash
+mvn spring-boot:run                              # 第一次启动（默认 ./queue-data）
+curl -X POST http://localhost:8080/api/queue/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"businessKey":"order-1001","type":"email","payload":"welcome"}'
+curl http://localhost:8080/api/queue/stats       # 记下 committedOffset 与各状态计数
+# Ctrl+C 停掉进程，再重新启动
+mvn spring-boot:run                              # 日志可见 RecoveryReport
+curl http://localhost:8080/api/queue/stats       # 位点/计数与停止前一致
+curl -X POST http://localhost:8080/api/queue/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"businessKey":"order-1001","type":"email","payload":"welcome"}'
+# -> 409 DUPLICATE_BUSINESS_KEY：业务键跨重启仍去重
+```
+
+## 10. 关键设计取舍
+
+- **本地文件而非外部中间件**：满足本地可运行、可复现；语义正确性由单锁 + 单调位点 +
+  幂等标记保证，崩溃安全由“每次写 fsync + 先终态后位点 + CRC 校验 + 幂等重放 +
+  原子快照”保证。`persistence.enabled=false` 可整体退回纯内存模式。
 - **严格 FIFO 优先于吞吐**：单分区单线程，退避中的队首会短暂阻塞后续任务，
   以换取可观察顺序的确定性。
-- **永久去重窗口 = 进程生命周期**：终态键在内存中保留；容量计数只含未终态任务，
-  因此历史终态不占用队列容量。
+- **去重窗口 = 队列数据的生命周期**：终态记录（含业务键）随快照/日志持久保留，
+  跨重启拦截重复投递；容量计数只含未终态任务，历史终态不占用队列容量。
+  历史收拢只折叠“被覆盖的状态变迁”，不删除任何任务记录与业务键。

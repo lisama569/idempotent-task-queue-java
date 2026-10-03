@@ -9,10 +9,18 @@ import com.github.lisama569.idempotenttaskqueuejava.domain.TaskRecord;
 public class DefaultTaskContext implements TaskContext {
     private final TaskRecord task;
     private final int attempt;
+    /** 幂等标记落点：默认仅写内存记录；ConsumerWorker 注入经队列/存储的持久化路径。 */
+    private final java.util.function.Consumer<TaskRecord> sideEffectMarker;
 
     public DefaultTaskContext(TaskRecord task, int attempt) {
+        this(task, attempt, TaskRecord::markSideEffectDone);
+    }
+
+    public DefaultTaskContext(TaskRecord task, int attempt,
+                              java.util.function.Consumer<TaskRecord> sideEffectMarker) {
         this.task = task;
         this.attempt = attempt;
+        this.sideEffectMarker = sideEffectMarker;
     }
 
     @Override
@@ -27,7 +35,7 @@ public class DefaultTaskContext implements TaskContext {
 
     @Override
     public void markSideEffectDone() {
-        task.markSideEffectDone();
+        sideEffectMarker.accept(task);
     }
 
     @Override

@@ -3,12 +3,15 @@ package com.github.lisama569.idempotenttaskqueuejava.tests;
 import com.github.lisama569.idempotenttaskqueuejava.config.QueueProperties;
 import com.github.lisama569.idempotenttaskqueuejava.consumer.ConsumerWorker;
 import com.github.lisama569.idempotenttaskqueuejava.limit.TokenBucketRateLimiter;
+import com.github.lisama569.idempotenttaskqueuejava.persistence.PersistenceManager;
+import com.github.lisama569.idempotenttaskqueuejava.persistence.RecoveredState;
 import com.github.lisama569.idempotenttaskqueuejava.queue.IdempotentTaskQueue;
 import com.github.lisama569.idempotenttaskqueuejava.queue.OffsetManager;
 import com.github.lisama569.idempotenttaskqueuejava.retry.FixedIntervalRetryPolicy;
 import com.github.lisama569.idempotenttaskqueuejava.retry.RetryPolicy;
 import com.github.lisama569.idempotenttaskqueuejava.store.TaskStore;
 
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.ZoneOffset;
@@ -44,5 +47,33 @@ public final class TestQueueFactory {
 
     public static ConsumerWorker worker(IdempotentTaskQueue q, TestHandlers.CountingHandler handler) {
         return new ConsumerWorker(q, handler, q.clock(), 5L);
+    }
+
+    /**
+     * 持久化队列实例（一次“进程生命周期”）：同一目录上销毁旧实例、新建实例即模拟完整重启。
+     * 模拟崩溃时直接丢弃引用即可（每次写入均已 fsync，不 close 等价于 kill -9）。
+     */
+    public record PersistentQueue(IdempotentTaskQueue queue, PersistenceManager persistence,
+                                  TaskStore store, OffsetManager offsets) implements AutoCloseable {
+        @Override
+        public void close() {
+            persistence.close();
+        }
+    }
+
+    public static PersistentQueue persistentQueue(QueueProperties p, Path dir) {
+        PersistenceManager pm = new PersistenceManager(dir,
+                p.getPersistence().getCompactThresholdBytes());
+        RecoveredState rs = pm.recover();
+        TaskStore store = TaskStore.restore(p.getCapacity(), rs.records(), rs.sequence(),
+                rs.acceptedTotal(), rs.rejectedDuplicateTotal(), rs.rejectedCapacityTotal());
+        store.setListener(pm);
+        OffsetManager offsets = new OffsetManager(rs.committedOffset());
+        offsets.setCommitListener(pm::onOffsetCommitted);
+        TokenBucketRateLimiter limiter = new TokenBucketRateLimiter(p.getRateLimitPerSecond());
+        IdempotentTaskQueue q = new IdempotentTaskQueue(store, limiter,
+                new FixedIntervalRetryPolicy(Duration.ofMillis(p.getRetryBackoffMillis())),
+                offsets, p, Clock.systemUTC());
+        return new PersistentQueue(q, pm, store, offsets);
     }
 }

@@ -32,11 +32,44 @@ public class TaskStore {
     private long rejectedDuplicateTotal = 0L;
     private long rejectedCapacityTotal = 0L;
 
+    /** 状态变更监听（持久化层挂载点）；始终在 monitor 锁内回调，事件流与内存变更同序。 */
+    private StoreListener listener = StoreListener.NO_OP;
+
     public TaskStore(int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("capacity must be positive: " + capacity);
         }
         this.capacity = capacity;
+    }
+
+    public void setListener(StoreListener listener) {
+        synchronized (monitor) {
+            this.listener = listener == null ? StoreListener.NO_OP : listener;
+        }
+    }
+
+    /**
+     * 从持久化恢复产物重建存储：activeCount 由非终态记录重新推导，
+     * 因此“重启前占容量的任务重启后仍占容量、已结束的不再占”。
+     */
+    public static TaskStore restore(int capacity, List<TaskRecord> records, long sequence,
+                                    long acceptedTotal, long rejectedDuplicateTotal,
+                                    long rejectedCapacityTotal) {
+        TaskStore store = new TaskStore(capacity);
+        synchronized (store.monitor) {
+            for (TaskRecord r : records) {
+                store.byId.put(r.getId(), r);
+                store.byBusinessKey.put(r.getBusinessKey(), r);
+                if (!r.getStatus().isTerminal()) {
+                    store.activeCount++;
+                }
+            }
+            store.sequence = sequence;
+            store.acceptedTotal = acceptedTotal;
+            store.rejectedDuplicateTotal = rejectedDuplicateTotal;
+            store.rejectedCapacityTotal = rejectedCapacityTotal;
+        }
+        return store;
     }
 
     /**
@@ -48,6 +81,7 @@ public class TaskStore {
             TaskRecord existing = byBusinessKey.get(businessKey);
             if (existing != null) {
                 rejectedDuplicateTotal++;
+                listener.onDuplicateRejected(rejectedDuplicateTotal);
                 return EnqueueResult.rejected(
                         RejectReason.DUPLICATE_BUSINESS_KEY,
                         existing.getId(),
@@ -56,6 +90,7 @@ public class TaskStore {
             }
             if (activeCount >= capacity) {
                 rejectedCapacityTotal++;
+                listener.onCapacityRejected(rejectedCapacityTotal);
                 return EnqueueResult.rejected(
                         RejectReason.QUEUE_FULL,
                         null,
@@ -67,6 +102,7 @@ public class TaskStore {
             byBusinessKey.put(businessKey, record);
             activeCount++;
             acceptedTotal++;
+            listener.onEnqueued(record, acceptedTotal);
             return EnqueueResult.accepted(id);
         }
     }
@@ -114,6 +150,7 @@ public class TaskStore {
                 if (s == TaskStatus.PENDING || s == TaskStatus.RETRY_WAITING) {
                     if (!r.getNextVisibleAt().isAfter(now)) {
                         int attempt = r.markDelivering(now.plusMillis(deliveryTimeoutMillis));
+                        listener.onStatusChanged(r);
                         return Optional.of(r);
                     }
                     // 队首尚未到可见时间：严格 FIFO，不跳过，返回空。
@@ -123,6 +160,7 @@ public class TaskStore {
                     // 僵死重投：同一任务再次投递，消费侧必须以幂等守卫去重副作用。
                     int attempt = r.markDelivering(now.plusMillis(deliveryTimeoutMillis));
                     r.countStaleDelivery();
+                    listener.onStatusChanged(r);
                     return Optional.of(r);
                 }
                 if (s == TaskStatus.DELIVERING) {
@@ -144,6 +182,7 @@ public class TaskStore {
             }
             r.markSucceeded(now);
             activeCount--;
+            listener.onStatusChanged(r);
             return true;
         }
     }
@@ -165,6 +204,7 @@ public class TaskStore {
                 r.markFailedPermanent(errorMessage, now);
                 activeCount--;
             }
+            listener.onStatusChanged(r);
             return Optional.of(r);
         }
     }
@@ -173,6 +213,22 @@ public class TaskStore {
         synchronized (monitor) {
             TaskRecord r = byId.get(taskId);
             return r != null && r.getStatus().isTerminal();
+        }
+    }
+
+    /**
+     * 标记业务副作用已执行（幂等守卫）：与状态变更一样走监听器，
+     * 因此开启持久化后该标记随日志落盘，真实重启后仍然生效。
+     */
+    public boolean markSideEffectDone(long taskId) {
+        synchronized (monitor) {
+            TaskRecord r = byId.get(taskId);
+            if (r == null || r.getStatus().isTerminal() || r.isSideEffectDone()) {
+                return false;
+            }
+            r.markSideEffectDone();
+            listener.onStatusChanged(r);
+            return true;
         }
     }
 

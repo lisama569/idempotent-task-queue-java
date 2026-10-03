@@ -11,9 +11,23 @@ import com.github.lisama569.idempotenttaskqueuejava.exception.OffsetRejectedExce
  */
 public class OffsetManager {
     private long committed;
+    /** 位点提交成功后的回调（持久化层挂载点）；在调用方持有的存储锁内触发。 */
+    private java.util.function.LongConsumer commitListener = c -> { };
 
     public OffsetManager() {
         this.committed = 0L;
+    }
+
+    /** 从持久化位点恢复（重启场景）：下一个待处理任务仍是 committed+1。 */
+    public OffsetManager(long initialCommitted) {
+        if (initialCommitted < 0) {
+            throw new IllegalArgumentException("initialCommitted must be >= 0: " + initialCommitted);
+        }
+        this.committed = initialCommitted;
+    }
+
+    public void setCommitListener(java.util.function.LongConsumer commitListener) {
+        this.commitListener = commitListener == null ? c -> { } : commitListener;
     }
 
     /** 当前已提交位点：下一个待处理任务ID为 committed+1。 */
@@ -45,5 +59,6 @@ public class OffsetManager {
             throw new OffsetRejectedException(requested, committed, OffsetRejectReason.GAP);
         }
         committed = requested;
+        commitListener.accept(requested);
     }
 }

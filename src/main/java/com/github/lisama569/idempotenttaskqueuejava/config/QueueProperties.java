@@ -13,6 +13,24 @@ public class QueueProperties {
     private long retryBackoffMillis = 50;
     private boolean autoStartWorker = true;
     private long deliveryTimeoutMillis = 5000;
+    private Persistence persistence = new Persistence();
+
+    /** 本地持久化与恢复配置。 */
+    public static class Persistence {
+        /** 是否启用本地持久化（关闭即退回纯内存模式，行为与旧版一致）。 */
+        private boolean enabled = true;
+        /** 本地存储目录（快照 + 日志）；同一目录重启即恢复。 */
+        private String dir = "./queue-data";
+        /** 日志超过该字节数即触发历史收拢（快照压缩 + 日志重置）。 */
+        private long compactThresholdBytes = 1_048_576L;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public String getDir() { return dir; }
+        public void setDir(String dir) { this.dir = dir; }
+        public long getCompactThresholdBytes() { return compactThresholdBytes; }
+        public void setCompactThresholdBytes(long compactThresholdBytes) { this.compactThresholdBytes = compactThresholdBytes; }
+    }
 
     public int getCapacity() { return capacity; }
     public void setCapacity(int capacity) { this.capacity = capacity; }
@@ -26,4 +44,6 @@ public class QueueProperties {
     public void setAutoStartWorker(boolean autoStartWorker) { this.autoStartWorker = autoStartWorker; }
     public long getDeliveryTimeoutMillis() { return deliveryTimeoutMillis; }
     public void setDeliveryTimeoutMillis(long deliveryTimeoutMillis) { this.deliveryTimeoutMillis = deliveryTimeoutMillis; }
+    public Persistence getPersistence() { return persistence; }
+    public void setPersistence(Persistence persistence) { this.persistence = persistence; }
 }

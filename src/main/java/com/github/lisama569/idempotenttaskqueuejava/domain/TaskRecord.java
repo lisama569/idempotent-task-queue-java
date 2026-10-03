@@ -34,6 +34,25 @@ public final class TaskRecord {
         this.nextVisibleAt = now;
     }
 
+    /** 从持久化状态完整重建一条记录（恢复专用，不走任何状态迁移逻辑）。 */
+    public static TaskRecord restore(long id, String businessKey, String type, String payload,
+                                     int maxAttempts, Instant enqueuedAt,
+                                     TaskStatus status, int attempts,
+                                     Instant nextVisibleAt, Instant lastFailureAt,
+                                     String lastErrorMessage, boolean sideEffectDone,
+                                     int staleDeliveries, long version) {
+        TaskRecord r = new TaskRecord(id, businessKey, type, payload, maxAttempts, enqueuedAt);
+        r.status = status;
+        r.attempts = attempts;
+        r.nextVisibleAt = nextVisibleAt;
+        r.lastFailureAt = lastFailureAt;
+        r.lastErrorMessage = lastErrorMessage;
+        r.sideEffectDone = sideEffectDone;
+        r.staleDeliveries = staleDeliveries;
+        r.version = version;
+        return r;
+    }
+
     public long getId() { return id; }
     public String getBusinessKey() { return businessKey; }
     public String getType() { return type; }
