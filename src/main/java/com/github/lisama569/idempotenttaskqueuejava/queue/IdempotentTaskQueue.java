@@ -3,6 +3,7 @@ package com.github.lisama569.idempotenttaskqueuejava.queue;
 import com.github.lisama569.idempotenttaskqueuejava.config.QueueProperties;
 import com.github.lisama569.idempotenttaskqueuejava.domain.*;
 import com.github.lisama569.idempotenttaskqueuejava.limit.RateLimiter;
+import com.github.lisama569.idempotenttaskqueuejava.persistence.QueuePersistence;
 import com.github.lisama569.idempotenttaskqueuejava.retry.RetryPolicy;
 import com.github.lisama569.idempotenttaskqueuejava.store.RetryDecision;
 import com.github.lisama569.idempotenttaskqueuejava.store.TaskStore;
@@ -30,6 +31,8 @@ public class IdempotentTaskQueue {
     private final OffsetManager offsetManager;
     private final QueueProperties properties;
     private final Clock clock;
+    /** 本地持久化；为 null 时退化为纯内存模式（行为与旧版完全一致）。 */
+    private final QueuePersistence persistence;
 
     private long rejectedInvalidTotal = 0L;
     private long rejectedRateTotal = 0L;
@@ -42,12 +45,19 @@ public class IdempotentTaskQueue {
 
     public IdempotentTaskQueue(TaskStore store, RateLimiter rateLimiter, RetryPolicy retryPolicy,
                                OffsetManager offsetManager, QueueProperties properties, Clock clock) {
+        this(store, rateLimiter, retryPolicy, offsetManager, properties, clock, null);
+    }
+
+    public IdempotentTaskQueue(TaskStore store, RateLimiter rateLimiter, RetryPolicy retryPolicy,
+                               OffsetManager offsetManager, QueueProperties properties, Clock clock,
+                               QueuePersistence persistence) {
         this.store = store;
         this.rateLimiter = rateLimiter;
         this.retryPolicy = retryPolicy;
         this.offsetManager = offsetManager;
         this.properties = properties;
         this.clock = clock;
+        this.persistence = persistence;
     }
 
     /**
@@ -73,9 +83,22 @@ public class IdempotentTaskQueue {
                     "rate limit exceeded: max=" + properties.getRateLimitPerSecond() + "/s");
         }
 
-        // 去重 + 容量判定 + 插入，在存储单锁内原子完成
-        EnqueueResult result = store.enqueue(businessKey, type, payload,
-                properties.getMaxAttempts(), now);
+        // 去重 + 容量判定 + 插入 + 日志追加，在存储单锁内原子完成
+        EnqueueResult result = store.withLock(() -> {
+            EnqueueResult r = store.enqueue(businessKey, type, payload,
+                    properties.getMaxAttempts(), now);
+            if (persistence != null) {
+                if (r.isAccepted()) {
+                    persistence.onEnqueued(store.findById(r.getTaskId()).orElseThrow());
+                } else if (r.getRejectReason() == RejectReason.DUPLICATE_BUSINESS_KEY) {
+                    persistence.onRejectedDuplicate();
+                } else if (r.getRejectReason() == RejectReason.QUEUE_FULL) {
+                    persistence.onRejectedCapacity();
+                }
+                maybeAutoCompact();
+            }
+            return r;
+        });
         if (result.isAccepted()) {
             log.info("accept enqueue: taskId={}, businessKey={}, committedOffset={}",
                     result.getTaskId(), businessKey, offsetManager.committed());
@@ -120,6 +143,9 @@ public class IdempotentTaskQueue {
         return store.withLock(() -> {
             Optional<TaskRecord> claimed = store.claimNext(now, properties.getDeliveryTimeoutMillis());
             claimed.ifPresent(r -> {
+                if (persistence != null) {
+                    persistence.onClaimed(r);
+                }
                 if (r.getId() <= offsetManager.committed()) {
                     // 理论不可达：终态任务会被 claim 扫描跳过；保留为防御性断言
                     throw new IllegalStateException("claimed task below committed offset: taskId="
@@ -142,6 +168,11 @@ public class IdempotentTaskQueue {
             boolean changed = store.completeSuccess(taskId, now);
             if (changed) {
                 advanceOffset(taskId);
+                if (persistence != null) {
+                    // 终态与位点同帧落盘：崩溃恢复后两者绝不矛盾
+                    persistence.onTerminal(task, offsetManager.committed());
+                    maybeAutoCompact();
+                }
                 log.info("ack success: taskId={}, committedOffset={}, sideEffectDone={}",
                         taskId, offsetManager.committed(), task.isSideEffectDone());
             } else {
@@ -162,15 +193,27 @@ public class IdempotentTaskQueue {
                     ? RetryDecision.retryAfter(retryPolicy.nextBackoff(task))
                     : RetryDecision.noRetry();
             Optional<TaskRecord> updated = store.completeFailure(taskId, errorMessage, decision, now);
+            if (updated.isPresent()) {
+                TaskRecord r = updated.get();
+                if (decision.retry() && r.getStatus() == TaskStatus.RETRY_WAITING) {
+                    if (persistence != null) {
+                        persistence.onRetryWaiting(r);
+                    }
+                } else if (!decision.retry() && r.getStatus() == TaskStatus.FAILED_PERMANENT) {
+                    // 先推进位点，再把“终态+位点”同帧落盘：恢复后两者不矛盾
+                    advanceOffset(taskId);
+                    if (persistence != null) {
+                        persistence.onTerminal(r, offsetManager.committed());
+                    }
+                }
+                if (persistence != null) {
+                    maybeAutoCompact();
+                }
+            }
             if (decision.retry()) {
                 log.info("ack failure: taskId={}, attempt={}, retryAfter={}ms, error={}",
                         taskId, task.getAttempts(), decision.backoff().toMillis(), errorMessage);
             } else {
-                updated.ifPresent(r -> {
-                    if (r.getStatus() == TaskStatus.FAILED_PERMANENT) {
-                        advanceOffset(taskId);
-                    }
-                });
                 log.info("ack failure exhausted: taskId={}, attempts={}, status={}, committedOffset={}, error={}",
                         taskId, task.getAttempts(),
                         updated.map(TaskRecord::getStatus).orElse(null),
@@ -190,6 +233,42 @@ public class IdempotentTaskQueue {
                     taskId, offsetManager.committed(), e.getMessage());
             throw e;
         }
+    }
+
+    /**
+     * 副作用幂等标记的持久化钩子：handler 标记 sideEffectDone 之前先落盘，
+     * 保证“标记已落盘而进程随即崩溃”时，重启后重投仍能跳过副作用。
+     * 纯内存模式返回 null（无持久化，行为同旧版）。
+     */
+    public Runnable sideEffectPersistHook(long taskId) {
+        return persistence == null ? null : () -> persistence.onSideEffect(taskId);
+    }
+
+    /**
+     * 历史收拢：把当前全量状态写入快照并清空日志。
+     * 在存储锁内取状态，快照内容自洽；不影响正常投递与消费。
+     */
+    public QueuePersistence.CompactionReport compact() {
+        if (persistence == null) {
+            return null;
+        }
+        return store.withLock(() -> persistence.compact(
+                store.exportRecords(), store.currentSequence(),
+                store.acceptedTotal(), store.rejectedDuplicateTotal(), store.rejectedCapacityTotal(),
+                offsetManager.committed()));
+    }
+
+    /** 日志超过阈值时自动收拢（调用方须已持存储锁）。 */
+    private void maybeAutoCompact() {
+        if (persistence != null
+                && persistence.journalSizeBytes() > properties.getJournalCompactThresholdBytes()) {
+            compact();
+        }
+    }
+
+    /** 最近一次恢复报告（纯内存模式为 null）。 */
+    public com.github.lisama569.idempotenttaskqueuejava.persistence.RecoveryReport lastRecovery() {
+        return persistence == null ? null : persistence.lastRecoveryReport();
     }
 
     public QueueStats stats() {

@@ -105,7 +105,8 @@ public class ConsumerWorker {
         TaskRecord task = claimed;
         long taskId = task.getId();
         int attempt = task.getAttempts();
-        TaskContext context = new DefaultTaskContext(task, attempt);
+        TaskContext context = new DefaultTaskContext(task, attempt,
+                queue.sideEffectPersistHook(taskId));
         try {
             handler.handle(context);
             if (crashBeforeAckOnce.remove(taskId)) {

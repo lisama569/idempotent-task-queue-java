@@ -203,6 +203,47 @@ public class TaskStore {
     public long rejectedCapacityTotal() { synchronized (monitor) { return rejectedCapacityTotal; } }
     public long totalTasks() { synchronized (monitor) { return byId.size(); } }
 
+    /**
+     * 恢复入口（仅供持久化层在实例新建后、对外服务前调用）：
+     * 把快照+日志重放出的完整状态一次性装载进存储。
+     * 要求存储为空，否则说明使用方式错误，直接拒绝。
+     */
+    public void restoreState(List<TaskRecord> records, long sequence,
+                             long acceptedTotal, long rejectedDuplicateTotal,
+                             long rejectedCapacityTotal) {
+        synchronized (monitor) {
+            if (!byId.isEmpty() || this.sequence != 0) {
+                throw new IllegalStateException("restoreState requires a fresh, empty store");
+            }
+            int active = 0;
+            for (TaskRecord r : records) {
+                byId.put(r.getId(), r);
+                byBusinessKey.put(r.getBusinessKey(), r);
+                if (!r.getStatus().isTerminal()) {
+                    active++;
+                }
+            }
+            this.sequence = sequence;
+            this.activeCount = active;
+            this.acceptedTotal = acceptedTotal;
+            this.rejectedDuplicateTotal = rejectedDuplicateTotal;
+            this.rejectedCapacityTotal = rejectedCapacityTotal;
+        }
+    }
+
+    /** 导出当前全部记录（供快照收拢使用）；调用方须在 {@link #withLock} 内使用返回值。 */
+    public List<TaskRecord> exportRecords() {
+        synchronized (monitor) {
+            return new ArrayList<>(byId.values());
+        }
+    }
+
+    public long currentSequence() {
+        synchronized (monitor) {
+            return sequence;
+        }
+    }
+
     /** 在存储锁内执行原子复合操作（例如 终态迁移 + 位点提交 联动）。锁可重入。 */
     public <T> T withLock(java.util.function.Supplier<T> action) {
         synchronized (monitor) {

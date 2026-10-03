@@ -9,10 +9,17 @@ import com.github.lisama569.idempotenttaskqueuejava.domain.TaskRecord;
 public class DefaultTaskContext implements TaskContext {
     private final TaskRecord task;
     private final int attempt;
+    /** 副作用标记落盘钩子（纯内存模式为 null）：先落盘再置内存标记。 */
+    private final Runnable sideEffectPersistHook;
 
     public DefaultTaskContext(TaskRecord task, int attempt) {
+        this(task, attempt, null);
+    }
+
+    public DefaultTaskContext(TaskRecord task, int attempt, Runnable sideEffectPersistHook) {
         this.task = task;
         this.attempt = attempt;
+        this.sideEffectPersistHook = sideEffectPersistHook;
     }
 
     @Override
@@ -27,6 +34,13 @@ public class DefaultTaskContext implements TaskContext {
 
     @Override
     public void markSideEffectDone() {
+        if (task.isSideEffectDone()) {
+            return;
+        }
+        // 先落盘再置内存标记：若进程在两者之间崩溃，恢复后仍是“已标记”，重投跳过副作用
+        if (sideEffectPersistHook != null) {
+            sideEffectPersistHook.run();
+        }
         task.markSideEffectDone();
     }
 

@@ -49,6 +49,27 @@ public final class TaskRecord {
     public int getStaleDeliveries() { return staleDeliveries; }
     public long getVersion() { return version; }
 
+    /**
+     * 从本地快照完整恢复一条记录（含全部可变字段）。
+     * 仅供持久化恢复使用；恢复出的记录与崩溃前内存态逐字段一致。
+     */
+    public static TaskRecord restore(long id, String businessKey, String type, String payload,
+                                     int maxAttempts, Instant enqueuedAt, TaskStatus status,
+                                     int attempts, Instant nextVisibleAt, Instant lastFailureAt,
+                                     String lastErrorMessage, boolean sideEffectDone,
+                                     int staleDeliveries, long version) {
+        TaskRecord r = new TaskRecord(id, businessKey, type, payload, maxAttempts, enqueuedAt);
+        r.status = status;
+        r.attempts = attempts;
+        r.nextVisibleAt = nextVisibleAt;
+        r.lastFailureAt = lastFailureAt;
+        r.lastErrorMessage = lastErrorMessage;
+        r.sideEffectDone = sideEffectDone;
+        r.staleDeliveries = staleDeliveries;
+        r.version = version;
+        return r;
+    }
+
     /** 置为投递中并累加尝试次数；nextVisibleAt 用作本次投递的僵死截止线。返回当前是第几次尝试（从 1 开始）。 */
     public int markDelivering(Instant deliveryDeadline) {
         this.attempts++;

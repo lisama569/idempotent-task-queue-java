@@ -13,6 +13,10 @@ public class QueueProperties {
     private long retryBackoffMillis = 50;
     private boolean autoStartWorker = true;
     private long deliveryTimeoutMillis = 5000;
+    /** 本地持久化目录；为空则纯内存模式（默认，行为与旧版一致）。 */
+    private String persistenceDir = "";
+    /** 日志超过该字节数后自动收拢为快照。 */
+    private long journalCompactThresholdBytes = 1_048_576L;
 
     public int getCapacity() { return capacity; }
     public void setCapacity(int capacity) { this.capacity = capacity; }
@@ -26,4 +30,9 @@ public class QueueProperties {
     public void setAutoStartWorker(boolean autoStartWorker) { this.autoStartWorker = autoStartWorker; }
     public long getDeliveryTimeoutMillis() { return deliveryTimeoutMillis; }
     public void setDeliveryTimeoutMillis(long deliveryTimeoutMillis) { this.deliveryTimeoutMillis = deliveryTimeoutMillis; }
+    public String getPersistenceDir() { return persistenceDir; }
+    public void setPersistenceDir(String persistenceDir) { this.persistenceDir = persistenceDir; }
+    public long getJournalCompactThresholdBytes() { return journalCompactThresholdBytes; }
+    public void setJournalCompactThresholdBytes(long journalCompactThresholdBytes) { this.journalCompactThresholdBytes = journalCompactThresholdBytes; }
+    public boolean isPersistenceEnabled() { return persistenceDir != null && !persistenceDir.isBlank(); }
 }

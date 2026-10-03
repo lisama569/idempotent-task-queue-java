@@ -72,4 +72,45 @@ public class QueueController {
     public QueueStats stats() {
         return queue.stats();
     }
+
+    /** 手动触发历史收拢：全量状态写入快照并清空日志。纯内存模式返回 enabled=false。 */
+    @PostMapping("/compact")
+    public Map<String, Object> compact() {
+        var report = queue.compact();
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (report == null) {
+            body.put("enabled", false);
+            body.put("detail", "persistence disabled; nothing to compact");
+            return body;
+        }
+        body.put("enabled", true);
+        body.put("tasksSnapshotted", report.tasksSnapshotted());
+        body.put("journalBytesBefore", report.journalBytesBefore());
+        body.put("journalBytesAfter", report.journalBytesAfter());
+        body.put("committedOffset", report.committedOffset());
+        return body;
+    }
+
+    /** 最近一次启动时的恢复报告（进度/位点/判断依据）。纯内存模式返回 enabled=false。 */
+    @GetMapping("/recovery")
+    public Map<String, Object> recovery() {
+        var report = queue.lastRecovery();
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (report == null) {
+            body.put("enabled", false);
+            return body;
+        }
+        body.put("enabled", true);
+        body.put("snapshotLoaded", report.snapshotLoaded());
+        body.put("snapshotCommittedOffset", report.snapshotCommittedOffset());
+        body.put("snapshotTaskCount", report.snapshotTaskCount());
+        body.put("journalRecordsReplayed", report.journalRecordsReplayed());
+        body.put("journalTruncatedAtBytes", report.journalTruncatedAtBytes());
+        body.put("journalTornTailBytes", report.journalTornTailBytes());
+        body.put("tasksRecovered", report.tasksRecovered());
+        body.put("committedOffset", report.committedOffset());
+        body.put("sequence", report.sequence());
+        body.put("basis", report.basis());
+        return body;
+    }
 }

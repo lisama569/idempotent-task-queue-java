@@ -16,6 +16,18 @@ public class OffsetManager {
         this.committed = 0L;
     }
 
+    /**
+     * 恢复入口（仅供持久化层在实例新建后、对外服务前调用）：
+     * 把日志/快照中恢复的已提交位点一次性装载。只允许前进，不允许回退。
+     */
+    public void restoreCommitted(long recovered) {
+        if (recovered < committed) {
+            throw new IllegalArgumentException(
+                    "recovered offset regresses: recovered=" + recovered + ", current=" + committed);
+        }
+        this.committed = recovered;
+    }
+
     /** 当前已提交位点：下一个待处理任务ID为 committed+1。 */
     public long committed() {
         return committed;
