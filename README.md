@@ -16,7 +16,7 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（23 个，含并发、重投、重试耗尽、位点回退、完整重启恢复、撕裂写恢复、收拢场景）
+# 运行全部测试（25 个，含并发、重投、重试耗尽、位点回退、完整重启恢复、撕裂写恢复、收拢及收拢中途被杀场景）
 mvn test
 
 # 启动应用（自动启动单分区消费 worker）
@@ -138,6 +138,10 @@ rejectedCapacityTotal。
 - 去重/容量拒绝也记日志（各一条小帧），因此 `acceptedTotal`、
   `rejectedDuplicateTotal`、`rejectedCapacityTotal` 等计数重启后连续。
   注意：`INVALID_TASK` 与 `RATE_LIMITED` 拒绝不触碰存储，属于进程级指标，重启后清零。
+- **REJECT 帧携带全局单调递增的 `rejectSeq`**：拒绝计数不依附任何任务记录，
+  无法复用记录版本号做幂等，因此每条拒绝事件带序号；快照记录已覆盖的
+  `lastRejectSeq` 高水位，重放时 `rejectSeq <= lastRejectSeq` 的事件跳过。
+  这是“收拢中途被杀不重复计数”的持久化依据（见 7.3）。
 
 ### 7.2 恢复规则与判断依据
 
@@ -145,15 +149,23 @@ rejectedCapacityTotal。
 
 1. 丢弃未 rename 的 `snapshot.tmp`（上次收拢中途被杀的残留，正式快照仍完整）；
 2. 校验并装载 `snapshot.dat`（magic + 格式版本 + CRC32）；
-3. 按序重放 `journal.log` 的 CRC 校验帧，按“事件版本号 > 记录当前版本才应用”幂等应用
-   （收拢中途崩溃会造成快照与日志重叠，靠版本号去重）；
+3. 按序重放 `journal.log` 的 CRC 校验帧，幂等应用：
+   - 任务事件按“事件版本号 > 记录当前版本才应用”去重；
+   - REJECT 事件按“`rejectSeq` > 快照 `lastRejectSeq` 高水位才应用”去重
+     （收拢中途崩溃会造成快照与日志重叠，重叠事件被跳过并计入恢复报告的
+     `journalEventsSkipped`，绝不重复计入拒绝计数）；
 4. 帧尾处理：
    - **帧不完整（撕裂写）** → 截断到最后一条完整帧，恢复为“已发生历史的一个一致前缀”，
      继续运行；
    - **帧完整但 CRC 不符 / 长度非法，或快照校验失败** → 抛 `RecoveryException`
      **拒绝启动**，异常消息说明损坏位置与判断依据，不悄悄糊过去；
-5. 恢复全程输出 `[RECOVERY]` 日志（快照任务数、重放帧数、截断位置、恢复后位点），
-   也可通过 `GET /api/queue/recovery` 查看最近一次恢复报告（进度/位点/依据）。
+   - **旧格式歧义（v1 快照 + 无序号 REJECT 帧）** → 无法判定该次拒绝是否已计入
+     快照计数（计入会重、不计会漏），同样抛 `RecoveryException` **拒绝启动**，
+     消息说明判断依据与人工处置方式（离线核对计数，或确认历史可弃后重置目录），
+     不会悄悄选一个口径继续对外服务；
+5. 恢复全程输出 `[RECOVERY]` 日志（快照任务数、重放帧数、跳过帧数、截断位置、
+   恢复后位点），也可通过 `GET /api/queue/recovery` 查看最近一次恢复报告
+   （进度/位点/依据）。
 
 恢复后口径：未终态任务继续占容量、终态不占；已用业务键继续拦截重复投递；
 `DELIVERING` 中的任务按既有投递超时机制重投（僵死重投语义不变）。
@@ -163,18 +175,30 @@ rejectedCapacityTotal。
 - **触发**：日志超过 `journal-compact-threshold-bytes`（默认 1MB）自动收拢；
   或手动 `POST /api/queue/compact`。
 - **过程**：在存储锁内取全量状态写快照（原子替换），再清空日志；
-  不影响正常投递与消费，收拢中途崩溃靠版本号幂等重放保证不重复应用。
+  不影响正常投递与消费。
+- **收拢中途被强杀的重启一致性规则**（这条路径不是天然成立的，依赖以下机制）：
+  收拢不是单个原子动作，崩溃点落在不同阶段时磁盘状态不同，恢复规则分别为：
+  1. 写在 `snapshot.tmp` 阶段被杀 → tmp 残留直接丢弃，正式快照与日志都还是旧的，完整一致；
+  2. **快照已 rename、日志尚未清空**被杀 → 磁盘上快照与日志重叠：
+     任务事件靠记录版本号、拒绝计数靠 `rejectSeq` 高水位幂等去重，
+     重启后拒绝计数（重复投递/容量）、各状态数量、消费位点、业务键查重结果
+     与停机前**完全一致**（恢复报告 `journalEventsSkipped` 可见被跳过的重叠帧数）；
+  3. 日志清空完成后被杀 → 等价于正常收拢完成。
 - **影响**：收拢前后语义完全一致（状态/位点/去重/计数）。注意业务键去重是**永久**的，
   因此终态任务的键会随快照保留（这是去重语义的必要代价），收拢压缩的是日志中的
-  历史变更记录。
+  历史变更记录。收拢中断不会让它空转：恢复后下一次收拢照常清空日志，
+  本地存储体积仍受控。
 
 ### 7.4 兼容范围
 
 - **第一次启动**：目录不存在则自动创建，从空状态开始。
 - **纯内存 → 持久化**：旧版本不产生任何本地数据，不存在迁移问题；
   不配置 `persistence-dir` 时行为与旧版完全一致（既有 15 个用例不回归）。
-- **格式版本**：快照/日志格式版本为 1；遇到不支持的版本或校验失败即拒绝启动，
-  不会以损坏状态继续运行。
+- **格式版本**：快照格式版本为 2（v2 起携带 `lastRejectSeq` 高水位；v1 快照仍可读取），
+  REJECT 日志帧自 v2 起携带 `rejectSeq`（旧格式无序号帧按 rejectSeq=0 识别）。
+  遇到不支持的版本或校验失败即拒绝启动，不会以损坏状态继续运行；
+  v1 快照与旧格式 REJECT 帧同时出现属于无法确定计数口径的歧义状态，同样拒绝启动
+  （见 7.2）。
 
 ## 8. 配置项（application.properties）
 
@@ -207,6 +231,7 @@ rejectedCapacityTotal。
 | `PersistenceRestartTest` | 同一目录重建实例模拟完整重启：已完成不重跑、未完成不丢且 FIFO 不乱、位点/各状态计数/去重/容量口径一致；副作用标记跨重启保留 |
 | `CrashMidWriteRecoveryTest` | 日志帧尾撕裂→截断为一致前缀并可继续；完整帧损坏/快照损坏→拒绝启动并说明依据 |
 | `CompactionTest` | 手动/自动收拢前后语义一致；收拢后重复投递、失败重试、重启恢复均正常 |
+| `CrashMidCompactionRecoveryTest` | 收拢在“快照已 rename、日志未清”之间被强杀→重启后拒绝计数/各状态数量/位点/查重与停机前完全一致，恢复后新拒绝、重试、消费、再次收拢照常；旧格式歧义状态→拒绝启动并说明依据 |
 
 ```bash
 mvn test                                  # 全部
@@ -214,6 +239,7 @@ mvn -Dtest=OffsetRejectTest test          # 单场景
 mvn -Dtest=PersistenceRestartTest test      # 完整重启恢复
 mvn -Dtest=CrashMidWriteRecoveryTest test  # 写一半被杀后的恢复
 mvn -Dtest=CompactionTest test            # 历史收拢
+mvn -Dtest=CrashMidCompactionRecoveryTest test  # 收拢中途被强杀后的重启一致性
 ```
 
 本地手动验证完整重启：
@@ -227,11 +253,26 @@ curl -X POST localhost:8080/api/queue/tasks -H 'Content-Type: application/json' 
 # 已完成任务不会重跑，未完成任务继续被消费，位点接续
 ```
 
+本地验证“收拢中途被强杀”路径（手工杀进程难以精确命中 rename 与清日志之间的窗口，
+确定性复现走自动化测试的崩溃钩子）：
+
+```bash
+mvn -Dtest=CrashMidCompactionRecoveryTest test
+# 观察日志：
+#   [TEST-INPUT]  停机前的拒绝计数/各状态数量/位点，以及强杀后磁盘上的重叠状态
+#                 （snapshot.dat 已存在、journal.log 未清空）
+#   [TEST-OFFSET] 重启恢复报告：framesReplayed / journalEventsSkipped / committed
+#   [TEST-RESULT] 重启前后计数逐项相等的断言结果；恢复后继续投递/消费/再次收拢
+#   [TEST-BASIS]  判断依据：rejectSeq 高水位 + 记录版本号幂等
+# 判定标准：重启后 rejectedDuplicateTotal / rejectedCapacityTotal 与停机前完全一致，
+# 恢复报告中 journalEventsSkipped > 0（重叠帧被跳过而非重复计入）。
+```
+
 ## 10. 关键设计取舍
 
 - **本地文件而非外部中间件**：默认纯内存；可选的本地持久化用“追加日志 + 原子快照”
   实现完整重启恢复，不引入任何外部组件。语义正确性由单锁 + 单调位点 + 幂等标记 +
-  “终态与位点同帧”保证。
+  “终态与位点同帧”+ “拒绝计数 rejectSeq 高水位”保证。
 - **严格 FIFO 优先于吞吐**：单分区单线程，退避中的队首会短暂阻塞后续任务，
   以换取可观察顺序的确定性。
 - **永久去重窗口**：终态键永久保留（启用持久化后随快照跨进程保留）；

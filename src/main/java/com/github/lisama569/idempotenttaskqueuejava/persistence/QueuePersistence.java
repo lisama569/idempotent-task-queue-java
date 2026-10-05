@@ -33,11 +33,17 @@ import java.util.zip.CRC32;
  *   <li>帧完整但 CRC 不符 / 长度非法、或快照校验失败 → 抛 {@link RecoveryException} 拒绝启动，
  *       并说明卡在哪、判断依据；</li>
  *   <li>事件携带记录版本号，重放按“事件版本 &gt; 当前版本才应用”幂等，
- *       因此收拢（先写快照再清日志）中途被杀也不会重复应用。</li>
+ *       因此收拢（先写快照再清日志）中途被杀也不会重复应用；</li>
+ *   <li>REJECT（去重/容量拒绝计数）不依附任务记录，携带全局单调递增的 rejectSeq；
+ *       快照记录已覆盖的 lastRejectSeq，重放时 rejectSeq &lt;= lastRejectSeq 即跳过，
+ *       收拢在“快照已 rename、日志未清”之间被杀也不会重复计数；</li>
+ *   <li>旧格式（v1 快照 / 无序号 REJECT 帧）组合无法判定拒绝事件是否已被快照覆盖
+ *       → 属于自相矛盾风险，抛 {@link RecoveryException} 拒绝启动并说明依据。</li>
  * </ul>
  *
  * <p>收拢（compact）：把当前全量状态写入 snapshot.tmp → fsync → 原子 rename 为 snapshot.dat →
- * 清空日志。rename 与清日志之间崩溃：快照与日志有重叠，靠版本号幂等重放消除。</p>
+ * 清空日志。rename 与清日志之间崩溃：快照与日志有重叠，任务事件靠版本号、拒绝计数靠 rejectSeq
+ * 幂等重放消除。</p>
  */
 public class QueuePersistence {
     private static final Logger log = LoggerFactory.getLogger(QueuePersistence.class);
@@ -46,13 +52,20 @@ public class QueuePersistence {
     private static final String SNAPSHOT_FILE = "snapshot.dat";
     private static final String SNAPSHOT_TMP_FILE = "snapshot.tmp";
     private static final int SNAPSHOT_MAGIC = 0x49545153; // "ITQS"
-    private static final int SNAPSHOT_FORMAT_VERSION = 1;
+    /** 当前写出的快照格式版本：v2 起携带 lastRejectSeq（拒绝计数幂等依据）。 */
+    private static final int SNAPSHOT_FORMAT_VERSION = 2;
+    /** 可读的最旧快照格式版本：v1 无 lastRejectSeq，按 0 处理并触发旧格式 REJECT 帧的歧义检查。 */
+    private static final int MIN_SUPPORTED_SNAPSHOT_FORMAT_VERSION = 1;
 
     private final Path dir;
     private final Path journalPath;
     private final Path snapshotPath;
     private final FileChannel journal;
     private final RecoveredState recoveredState;
+    /** 已落盘的最大 rejectSeq（恢复时从快照+日志重放得到，之后每记一条拒绝自增）。 */
+    private long lastRejectSeq;
+    /** 测试钩子：收拢在“快照已 rename、日志未清”之间回调，用于模拟收拢中途被杀。生产环境恒为 null。 */
+    private volatile Runnable compactionCrashHook;
 
     /** 恢复结果：交给 TaskStore/OffsetManager 一次性装载。 */
     public record RecoveredState(
@@ -73,12 +86,18 @@ public class QueuePersistence {
             long committedOffset) {
     }
 
-    private QueuePersistence(Path dir, FileChannel journal, RecoveredState state) {
+    private QueuePersistence(Path dir, FileChannel journal, RecoveredState state, long lastRejectSeq) {
         this.dir = dir;
         this.journalPath = dir.resolve(JOURNAL_FILE);
         this.snapshotPath = dir.resolve(SNAPSHOT_FILE);
         this.journal = journal;
         this.recoveredState = state;
+        this.lastRejectSeq = lastRejectSeq;
+    }
+
+    /** 仅供测试：设置在“快照已原子替换、日志尚未清空”之间触发的钩子，模拟收拢中途被杀。 */
+    public void setCompactionCrashHook(Runnable hook) {
+        this.compactionCrashHook = hook;
     }
 
     /**
@@ -99,20 +118,21 @@ public class QueuePersistence {
 
             // 2) 装载快照（校验失败 → 拒绝启动）
             MutableState state = new MutableState();
-            boolean snapshotLoaded = false;
-            long snapshotOffset = 0L;
-            int snapshotTaskCount = 0;
             if (Files.exists(snapshotPath)) {
                 loadSnapshot(snapshotPath, state);
-                snapshotLoaded = true;
-                snapshotOffset = state.committedOffset;
-                snapshotTaskCount = state.tasks.size();
-                log.info("[RECOVERY] snapshot loaded: tasks={}, committedOffset={}, sequence={}",
-                        snapshotTaskCount, snapshotOffset, state.sequence);
+                state.snapshotLoaded = true;
+                state.snapshotCommittedOffset = state.committedOffset;
+                state.snapshotTaskCount = state.tasks.size();
+                log.info("[RECOVERY] snapshot loaded: formatVersion={}, tasks={}, committedOffset={}, "
+                                + "sequence={}, lastRejectSeq={}",
+                        state.snapshotVersion, state.tasks.size(), state.committedOffset,
+                        state.sequence, state.lastRejectSeq);
             }
 
-            // 3) 重放日志；撕裂的帧尾截断，损坏的完整帧拒绝启动
+            // 3) 重放日志；撕裂的帧尾截断，损坏的完整帧拒绝启动；
+            //    与快照重叠的事件（版本号/rejectSeq 已覆盖）跳过不计
             long replayed = 0L;
+            long skipped = 0L;
             long truncatedAt = -1L;
             long tornBytes = 0L;
             long validLength = 0L;
@@ -136,11 +156,20 @@ public class QueuePersistence {
                                 offset, tornBytes);
                         break;
                     }
-                    apply(JournalCodec.decodeEvent(payload), state);
-                    replayed++;
+                    if (apply(JournalCodec.decodeEvent(payload), state)) {
+                        replayed++;
+                    } else {
+                        skipped++;
+                    }
                     offset += frame.frameBytes;
                     validLength = offset;
                 }
+            }
+            if (skipped > 0) {
+                log.info("[RECOVERY] skipped {} journal events already covered by snapshot "
+                                + "(compaction interrupted between snapshot rename and journal truncate); "
+                                + "basis=record version / rejectSeq <= snapshot high-water",
+                        skipped);
             }
 
             // 4) 物理截断撕裂尾部，保证后续追加紧接最后一条完整帧
@@ -153,22 +182,24 @@ public class QueuePersistence {
             channel.position(channel.size());
 
             RecoveryReport report = new RecoveryReport(
-                    snapshotLoaded, snapshotOffset, snapshotTaskCount,
-                    replayed, truncatedAt, tornBytes,
+                    state.snapshotLoaded, state.snapshotCommittedOffset, state.snapshotTaskCount,
+                    replayed, skipped, truncatedAt, tornBytes,
                     state.tasks.size(), state.committedOffset, state.sequence,
                     "snapshot(if valid) + ordered replay of crc-checked journal frames; "
                             + "torn tail truncated to last complete frame; "
-                            + "terminal-state and offset committed in the same frame");
+                            + "terminal-state and offset committed in the same frame; "
+                            + "snapshot/journal overlap deduped by record version and rejectSeq");
             log.info("[RECOVERY] done: tasksRecovered={}, committedOffset={}, sequence={}, "
-                            + "journalFramesReplayed={}, tornTailTruncatedAt={}, basis={}",
+                            + "journalFramesReplayed={}, journalEventsSkipped={}, tornTailTruncatedAt={}, basis={}",
                     report.tasksRecovered(), report.committedOffset(), report.sequence(),
-                    report.journalRecordsReplayed(), report.journalTruncatedAtBytes(), report.basis());
+                    report.journalRecordsReplayed(), report.journalEventsSkipped(),
+                    report.journalTruncatedAtBytes(), report.basis());
 
             RecoveredState recovered = new RecoveredState(
                     new ArrayList<>(state.tasks.values()), state.sequence,
                     state.acceptedTotal, state.rejectedDuplicateTotal, state.rejectedCapacityTotal,
                     state.committedOffset, report);
-            return new QueuePersistence(dir, channel, recovered);
+            return new QueuePersistence(dir, channel, recovered, state.lastRejectSeq);
         } catch (IOException e) {
             throw new RecoveryException("io failure during recovery from dir " + dir + ": " + e.getMessage(), e);
         }
@@ -206,11 +237,11 @@ public class QueuePersistence {
     }
 
     public synchronized void onRejectedDuplicate() {
-        append(JournalCodec.JournalEvent.reject(JournalCodec.REJECT_DUPLICATE));
+        append(JournalCodec.JournalEvent.reject(JournalCodec.REJECT_DUPLICATE, ++lastRejectSeq));
     }
 
     public synchronized void onRejectedCapacity() {
-        append(JournalCodec.JournalEvent.reject(JournalCodec.REJECT_CAPACITY));
+        append(JournalCodec.JournalEvent.reject(JournalCodec.REJECT_CAPACITY, ++lastRejectSeq));
     }
 
     public synchronized long journalSizeBytes() {
@@ -234,7 +265,8 @@ public class QueuePersistence {
 
     /**
      * 把当前全量状态收拢为快照并清空日志。调用方须持有存储锁，保证快照内容自洽。
-     * 中途崩溃安全：快照已原子替换而日志未清 → 重叠事件按版本号幂等跳过。
+     * 中途崩溃安全：快照已原子替换而日志未清 → 重叠的任务事件按版本号、
+     * 重叠的拒绝计数按 rejectSeq 幂等跳过，重启后计数与状态不重不漏。
      */
     public synchronized CompactionReport compact(List<TaskRecord> records, long sequence,
                                                  long acceptedTotal, long rejectedDuplicateTotal,
@@ -243,7 +275,7 @@ public class QueuePersistence {
         try {
             Path tmp = dir.resolve(SNAPSHOT_TMP_FILE);
             byte[] payload = encodeSnapshotPayload(records, sequence, acceptedTotal,
-                    rejectedDuplicateTotal, rejectedCapacityTotal, committedOffset);
+                    rejectedDuplicateTotal, rejectedCapacityTotal, committedOffset, lastRejectSeq);
             CRC32 crc = new CRC32();
             crc.update(payload);
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -261,7 +293,12 @@ public class QueuePersistence {
                 tmpChannel.force(true);
             }
             Files.move(tmp, snapshotPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            // 快照已生效：清空日志（崩溃则靠版本号幂等重放重叠部分）
+            // 崩溃点（测试钩子）：此刻快照已生效、日志未清，磁盘上两者重叠
+            Runnable hook = compactionCrashHook;
+            if (hook != null) {
+                hook.run();
+            }
+            // 快照已生效：清空日志（崩溃则靠版本号/rejectSeq 幂等重放重叠部分）
             journal.truncate(0);
             journal.force(true);
             journal.position(0);
@@ -286,7 +323,8 @@ public class QueuePersistence {
 
     private static byte[] encodeSnapshotPayload(List<TaskRecord> records, long sequence,
                                                 long acceptedTotal, long rejectedDuplicateTotal,
-                                                long rejectedCapacityTotal, long committedOffset) throws IOException {
+                                                long rejectedCapacityTotal, long committedOffset,
+                                                long lastRejectSeq) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         DataOutputStream out = new DataOutputStream(bos);
         out.writeLong(sequence);
@@ -294,6 +332,7 @@ public class QueuePersistence {
         out.writeLong(rejectedDuplicateTotal);
         out.writeLong(rejectedCapacityTotal);
         out.writeLong(committedOffset);
+        out.writeLong(lastRejectSeq); // v2 起：拒绝计数幂等依据
         out.writeInt(records.size());
         for (TaskRecord r : records) {
             out.writeLong(r.getId());
@@ -330,10 +369,12 @@ public class QueuePersistence {
             throw new RecoveryException("snapshot magic mismatch: " + Integer.toHexString(magic)
                     + "; refusing to start (not a queue snapshot or corrupted header)");
         }
-        if (version != SNAPSHOT_FORMAT_VERSION) {
+        if (version < MIN_SUPPORTED_SNAPSHOT_FORMAT_VERSION || version > SNAPSHOT_FORMAT_VERSION) {
             throw new RecoveryException("snapshot format version " + version + " not supported (expected "
-                    + SNAPSHOT_FORMAT_VERSION + "); refusing to start");
+                    + MIN_SUPPORTED_SNAPSHOT_FORMAT_VERSION + ".." + SNAPSHOT_FORMAT_VERSION
+                    + "); refusing to start");
         }
+        state.snapshotVersion = version;
         if (len <= 0 || bytes.length != Integer.BYTES * 3 + Long.BYTES + len) {
             throw new RecoveryException("snapshot length field inconsistent: declared=" + len
                     + ", actual=" + (bytes.length - Integer.BYTES * 3 - Long.BYTES)
@@ -353,6 +394,8 @@ public class QueuePersistence {
             state.rejectedDuplicateTotal = in.readLong();
             state.rejectedCapacityTotal = in.readLong();
             state.committedOffset = in.readLong();
+            // v2 起快照携带拒绝事件高水位；v1 没有该字段，保持 0 并在重放旧格式 REJECT 帧时做歧义检查
+            state.lastRejectSeq = version >= 2 ? in.readLong() : 0L;
             int count = in.readInt();
             for (int i = 0; i < count; i++) {
                 long id = in.readLong();
@@ -379,12 +422,16 @@ public class QueuePersistence {
         }
     }
 
-    /** 应用一条日志事件；按版本号幂等（收拢崩溃后快照与日志可能重叠）。 */
-    private static void apply(JournalCodec.JournalEvent e, MutableState state) {
+    /**
+     * 应用一条日志事件；按版本号/rejectSeq 幂等（收拢崩溃后快照与日志可能重叠）。
+     *
+     * @return true 表示事件真正生效；false 表示已被快照覆盖而跳过（不计入重放统计）
+     */
+    private static boolean apply(JournalCodec.JournalEvent e, MutableState state) {
         switch (e.type) {
             case JournalCodec.TYPE_ENQUEUE -> {
                 if (state.tasks.containsKey(e.taskId)) {
-                    return; // 快照已覆盖
+                    return false; // 快照已覆盖
                 }
                 state.tasks.put(e.taskId, TaskRecord.restore(e.taskId, e.businessKey, e.taskType,
                         e.payload, e.maxAttempts, e.enqueuedAt, TaskStatus.PENDING, 0,
@@ -394,19 +441,21 @@ public class QueuePersistence {
             }
             case JournalCodec.TYPE_CLAIM -> {
                 TaskRecord r = state.tasks.get(e.taskId);
-                if (r != null && e.version > r.getVersion()) {
-                    r.markDelivering(e.nextVisibleAt);
-                    while (r.getStaleDeliveries() < e.staleDeliveries) {
-                        r.countStaleDelivery();
-                    }
+                if (r == null || e.version <= r.getVersion()) {
+                    return false; // 快照已覆盖（或快照里没有该任务之外的矛盾不存在：ENQUEUE 必先于 CLAIM）
+                }
+                r.markDelivering(e.nextVisibleAt);
+                while (r.getStaleDeliveries() < e.staleDeliveries) {
+                    r.countStaleDelivery();
                 }
             }
             case JournalCodec.TYPE_RETRY_WAITING -> {
                 TaskRecord r = state.tasks.get(e.taskId);
-                if (r != null && e.version > r.getVersion()) {
-                    r.markRetryWaiting(e.nextVisibleAt, e.lastError,
-                            e.lastFailureAt != null ? e.lastFailureAt : e.nextVisibleAt);
+                if (r == null || e.version <= r.getVersion()) {
+                    return false;
                 }
+                r.markRetryWaiting(e.nextVisibleAt, e.lastError,
+                        e.lastFailureAt != null ? e.lastFailureAt : e.nextVisibleAt);
             }
             case JournalCodec.TYPE_TERMINAL -> {
                 TaskRecord r = state.tasks.get(e.taskId);
@@ -418,7 +467,7 @@ public class QueuePersistence {
                                 e.lastFailureAt != null ? e.lastFailureAt : Instant.EPOCH);
                     }
                 }
-                // 位点与终态同帧：只前进不回退
+                // 位点与终态同帧：只前进不回退（重放重叠帧时 max 幂等）
                 state.committedOffset = Math.max(state.committedOffset, e.committedOffset);
             }
             case JournalCodec.TYPE_SIDE_EFFECT -> {
@@ -428,14 +477,36 @@ public class QueuePersistence {
                 }
             }
             case JournalCodec.TYPE_REJECT -> {
+                if (e.rejectSeq == 0L && state.snapshotLoaded
+                        && state.snapshotVersion < 2) {
+                    // 旧格式 REJECT 帧（无序号）+ v1 快照（无高水位）：
+                    // 无法判定这次拒绝是否已计入快照计数 —— 计入会重、不计会漏，
+                    // 属于自相矛盾风险，拒绝启动并说明依据，而不是悄悄选一个口径继续。
+                    throw new RecoveryException(
+                            "ambiguous legacy REJECT event (no rejectSeq) with v1 snapshot present; "
+                                    + "refusing to start: cannot determine whether the rejection is already "
+                                    + "counted in the snapshot (compaction may have been interrupted between "
+                                    + "snapshot rename and journal truncate). "
+                                    + "Basis: snapshot format v1 carries no rejectSeq high-water mark. "
+                                    + "Manual recovery: verify counts offline, or reset the persistence dir "
+                                    + "if the history is expendable");
+                }
+                if (state.snapshotLoaded && e.rejectSeq <= state.lastRejectSeq) {
+                    // 快照已覆盖这次拒绝（收拢在 rename 与清日志之间被杀）→ 跳过，不重复计数。
+                    // 注：v2 快照前的旧格式帧（rejectSeq=0）必然已被快照计入（新代码只写新格式帧，
+                    // 旧帧只可能来自快照前的日志），0 <= lastRejectSeq 在此同样命中跳过。
+                    return false;
+                }
                 if (e.rejectKind == JournalCodec.REJECT_DUPLICATE) {
                     state.rejectedDuplicateTotal++;
                 } else {
                     state.rejectedCapacityTotal++;
                 }
+                state.lastRejectSeq = Math.max(state.lastRejectSeq, e.rejectSeq);
             }
             default -> throw new RecoveryException("unknown journal event type " + e.type);
         }
+        return true;
     }
 
     private static int statusCode(TaskStatus s) {
@@ -506,6 +577,12 @@ public class QueuePersistence {
         long rejectedDuplicateTotal;
         long rejectedCapacityTotal;
         long committedOffset;
+        /** 已应用的拒绝事件高水位（快照装载 + 日志重放共同推进）。 */
+        long lastRejectSeq;
+        boolean snapshotLoaded;
+        int snapshotVersion;
+        long snapshotCommittedOffset;
+        int snapshotTaskCount;
     }
 
 }

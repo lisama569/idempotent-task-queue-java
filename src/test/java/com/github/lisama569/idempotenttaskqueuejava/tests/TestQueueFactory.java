@@ -53,6 +53,15 @@ public final class TestQueueFactory {
      * 用同一个 dir 再次调用即模拟进程彻底重启。恢复失败会抛 RecoveryException。
      */
     public static IdempotentTaskQueue persistentQueue(QueueProperties p, Path dir) {
+        return openPersistent(p, dir).queue();
+    }
+
+    /** 队列 + 持久化句柄（测试需要直接操作持久化层，如模拟收拢中途被杀）。 */
+    public record PersistentQueueHolder(IdempotentTaskQueue queue, QueuePersistence persistence) {
+    }
+
+    /** 同 {@link #persistentQueue}，但把 QueuePersistence 句柄一并返回。 */
+    public static PersistentQueueHolder openPersistent(QueueProperties p, Path dir) {
         QueuePersistence persistence = QueuePersistence.open(dir);
         TaskStore store = new TaskStore(p.getCapacity());
         QueuePersistence.RecoveredState rs = persistence.recoveredState();
@@ -60,8 +69,9 @@ public final class TestQueueFactory {
                 rs.rejectedDuplicateTotal(), rs.rejectedCapacityTotal());
         OffsetManager om = new OffsetManager();
         om.restoreCommitted(rs.committedOffset());
-        return new IdempotentTaskQueue(store, new TokenBucketRateLimiter(p.getRateLimitPerSecond()),
+        IdempotentTaskQueue queue = new IdempotentTaskQueue(store, new TokenBucketRateLimiter(p.getRateLimitPerSecond()),
                 new FixedIntervalRetryPolicy(Duration.ofMillis(p.getRetryBackoffMillis())), om, p,
                 Clock.systemUTC(), persistence);
+        return new PersistentQueueHolder(queue, persistence);
     }
 }

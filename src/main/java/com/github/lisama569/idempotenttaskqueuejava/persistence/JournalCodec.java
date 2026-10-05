@@ -25,7 +25,10 @@ import java.util.zip.CRC32;
  *
  * <p>事件类型：ENQUEUE / CLAIM / RETRY_WAITING / TERMINAL（终态+位点同帧，保证两者不矛盾）
  * / SIDE_EFFECT / REJECT（去重与容量拒绝计数）。除 SIDE_EFFECT/REJECT 外，事件携带
- * 应用后的记录版本号，重放时按“事件版本 &gt; 当前版本才应用”保证幂等（收拢崩溃后可安全重放）。</p>
+ * 应用后的记录版本号，重放时按“事件版本 &gt; 当前版本才应用”保证幂等（收拢崩溃后可安全重放）；
+ * REJECT 不依附任何任务记录，改用全局单调递增的 rejectSeq 做幂等依据
+ * （快照记录已覆盖的 lastRejectSeq，重放时 rejectSeq &lt;= lastRejectSeq 即跳过）。
+ * 旧格式 REJECT 帧无序号，解码为 rejectSeq=0，由恢复逻辑按“是否有快照覆盖”裁决。</p>
  */
 final class JournalCodec {
     static final int TYPE_ENQUEUE = 1;
@@ -67,6 +70,8 @@ final class JournalCodec {
         long version;
         // REJECT
         int rejectKind;
+        /** 拒绝事件的全局单调序号（>=1）；0 表示旧格式帧（无序号）。 */
+        long rejectSeq;
 
         static JournalEvent enqueued(TaskRecord r) {
             JournalEvent e = new JournalEvent();
@@ -122,10 +127,11 @@ final class JournalCodec {
             return e;
         }
 
-        static JournalEvent reject(int rejectKind) {
+        static JournalEvent reject(int rejectKind, long rejectSeq) {
             JournalEvent e = new JournalEvent();
             e.type = TYPE_REJECT;
             e.rejectKind = rejectKind;
+            e.rejectSeq = rejectSeq;
             return e;
         }
     }
@@ -222,7 +228,11 @@ final class JournalCodec {
                     e.version = in.readLong();
                 }
                 case TYPE_SIDE_EFFECT -> e.taskId = in.readLong();
-                case TYPE_REJECT -> e.rejectKind = in.readByte();
+                case TYPE_REJECT -> {
+                    e.rejectKind = in.readByte();
+                    // 新格式帧尾带 rejectSeq；旧格式只有 kind 一个字节，按 rejectSeq=0（legacy）处理
+                    e.rejectSeq = in.available() >= Long.BYTES ? in.readLong() : 0L;
+                }
                 default -> throw new RecoveryException("unknown journal event type " + e.type);
             }
             return e;
@@ -269,7 +279,10 @@ final class JournalCodec {
                     out.writeLong(e.version);
                 }
                 case TYPE_SIDE_EFFECT -> out.writeLong(e.taskId);
-                case TYPE_REJECT -> out.writeByte(e.rejectKind);
+                case TYPE_REJECT -> {
+                    out.writeByte(e.rejectKind);
+                    out.writeLong(e.rejectSeq);
+                }
                 default -> throw new IllegalArgumentException("unknown event type " + e.type);
             }
             out.flush();
