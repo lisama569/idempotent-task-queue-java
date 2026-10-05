@@ -8,6 +8,7 @@ public record RecoveryReport(
         long snapshotCommittedOffset,
         int snapshotTaskCount,
         long journalRecordsReplayed,
+        long journalEventsSkipped,
         long journalTruncatedAtBytes,
         long journalTornTailBytes,
         int tasksRecovered,
@@ -16,6 +17,6 @@ public record RecoveryReport(
         String basis
 ) {
     public static RecoveryReport empty(String basis) {
-        return new RecoveryReport(false, 0L, 0, 0L, -1L, 0L, 0, 0L, 0L, basis);
+        return new RecoveryReport(false, 0L, 0, 0L, 0L, -1L, 0L, 0, 0L, 0L, basis);
     }
 }

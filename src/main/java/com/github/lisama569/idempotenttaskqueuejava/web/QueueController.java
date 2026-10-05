@@ -105,6 +105,7 @@ public class QueueController {
         body.put("snapshotCommittedOffset", report.snapshotCommittedOffset());
         body.put("snapshotTaskCount", report.snapshotTaskCount());
         body.put("journalRecordsReplayed", report.journalRecordsReplayed());
+        body.put("journalEventsSkipped", report.journalEventsSkipped());
         body.put("journalTruncatedAtBytes", report.journalTruncatedAtBytes());
         body.put("journalTornTailBytes", report.journalTornTailBytes());
         body.put("tasksRecovered", report.tasksRecovered());

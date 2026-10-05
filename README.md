@@ -16,7 +16,8 @@
 ## 1. 快速开始
 
 ```bash
-# 运行全部测试（23 个，含并发、重投、重试耗尽、位点回退、完整重启恢复、撕裂写恢复、收拢场景）
+# 运行全部测试（27 个，含并发、重投、重试耗尽、位点回退、完整重启恢复、撕裂写恢复、
+# 收拢及其“中途被强杀”场景）
 mvn test
 
 # 启动应用（自动启动单分区消费 worker）
@@ -135,7 +136,7 @@ rejectedCapacityTotal。
   恢复后绝不会出现“位点已前进、对应任务却没结束”或“任务已结束、重启后又冒出来”。
 - **副作用幂等标记先落盘、再置内存标记**：handler 调 `markSideEffectDone()` 后、
   ACK 前被杀，重启重投仍能跳过副作用（exactly-once 副作用语义跨进程保持）。
-- 去重/容量拒绝也记日志（各一条小帧），因此 `acceptedTotal`、
+- 去重/容量拒绝也记日志（各一条小帧，携带全局单调递增的 `rejectSeq` 序号），因此 `acceptedTotal`、
   `rejectedDuplicateTotal`、`rejectedCapacityTotal` 等计数重启后连续。
   注意：`INVALID_TASK` 与 `RATE_LIMITED` 拒绝不触碰存储，属于进程级指标，重启后清零。
 
@@ -143,10 +144,13 @@ rejectedCapacityTotal。
 
 启动时（`QueuePersistence.open`）：
 
-1. 丢弃未 rename 的 `snapshot.tmp`（上次收拢中途被杀的残留，正式快照仍完整）；
+1. 丢弃未 rename 的 `snapshot.tmp`（上次收拢中途被杀的残留，正式快照要么已原子替换、要么还是旧的，二者皆完整）；
 2. 校验并装载 `snapshot.dat`（magic + 格式版本 + CRC32）；
-3. 按序重放 `journal.log` 的 CRC 校验帧，按“事件版本号 > 记录当前版本才应用”幂等应用
-   （收拢中途崩溃会造成快照与日志重叠，靠版本号去重）；
+3. 按序重放 `journal.log` 的 CRC 校验帧，幂等应用：
+   - 任务类事件按“事件版本号 > 记录当前版本才应用”去重；
+   - 拒绝（REJECT）事件不依附于任务记录，按全局单调 `rejectSeq` 去重——
+     **快照中的拒绝计数之和就是快照已覆盖的 rejectSeq 上限**，
+     重放只应用序号超出该上限的事件，同一次拒绝绝不重复计数；
 4. 帧尾处理：
    - **帧不完整（撕裂写）** → 截断到最后一条完整帧，恢复为“已发生历史的一个一致前缀”，
      继续运行；
@@ -158,12 +162,22 @@ rejectedCapacityTotal。
 恢复后口径：未终态任务继续占容量、终态不占；已用业务键继续拦截重复投递；
 `DELIVERING` 中的任务按既有投递超时机制重投（僵死重投语义不变）。
 
-### 7.3 历史收拢（compaction）
+### 7.3 历史收拢（compaction）与“收拢中途被强杀”的一致性规则
 
 - **触发**：日志超过 `journal-compact-threshold-bytes`（默认 1MB）自动收拢；
   或手动 `POST /api/queue/compact`。
-- **过程**：在存储锁内取全量状态写快照（原子替换），再清空日志；
-  不影响正常投递与消费，收拢中途崩溃靠版本号幂等重放保证不重复应用。
+- **过程**：在存储锁内取全量状态写 `snapshot.tmp` → fsync → 原子 rename 为 `snapshot.dat`
+  → 清空日志。收拢不影响正常投递与消费。
+- **中途被强杀的两个断点及其恢复口径**（都不是“天然成立”，靠下列机制保证）：
+  1. **rename 之前被杀**：`snapshot.tmp` 残留、正式快照未替换。重启时 tmp 直接丢弃，
+     状态完全由“旧快照（如有）+ 完整日志”重建，清理可从头重跑；
+  2. **rename 之后、清日志之前被杀**：快照与日志内容重叠。重启时靠幂等重放去重——
+     任务类事件按记录版本号、REJECT 事件按 `rejectSeq` 跳过已被快照覆盖的部分，
+     **拒绝计数、各状态数量、消费位点与停机前完全一致，同一次拒绝不会被计两次**。
+- **无法判定的情况不猜**：旧格式（无 `rejectSeq`）的 REJECT 帧若与快照同时出现，
+  覆盖关系无法判定，属于矛盾状态——**拒绝启动**并在异常中说明卡在哪、判断依据
+  （`RecoveryException` 消息含 `legacy REJECT ... refusing to start`），
+  绝不悄悄用一份可能重复计数的状态继续对外服务。
 - **影响**：收拢前后语义完全一致（状态/位点/去重/计数）。注意业务键去重是**永久**的，
   因此终态任务的键会随快照保留（这是去重语义的必要代价），收拢压缩的是日志中的
   历史变更记录。
@@ -173,8 +187,9 @@ rejectedCapacityTotal。
 - **第一次启动**：目录不存在则自动创建，从空状态开始。
 - **纯内存 → 持久化**：旧版本不产生任何本地数据，不存在迁移问题；
   不配置 `persistence-dir` 时行为与旧版完全一致（既有 15 个用例不回归）。
-- **格式版本**：快照/日志格式版本为 1；遇到不支持的版本或校验失败即拒绝启动，
-  不会以损坏状态继续运行。
+- **格式版本**：快照格式版本为 1；REJECT 日志帧当前携带 `rejectSeq` 序号。
+  遇到不支持的版本、校验失败、或“旧格式 REJECT 帧 + 快照”这类覆盖关系不可判定的矛盾状态，
+  即拒绝启动，不会以损坏或可能重复计数的状态继续运行。
 
 ## 8. 配置项（application.properties）
 
@@ -207,6 +222,7 @@ rejectedCapacityTotal。
 | `PersistenceRestartTest` | 同一目录重建实例模拟完整重启：已完成不重跑、未完成不丢且 FIFO 不乱、位点/各状态计数/去重/容量口径一致；副作用标记跨重启保留 |
 | `CrashMidWriteRecoveryTest` | 日志帧尾撕裂→截断为一致前缀并可继续；完整帧损坏/快照损坏→拒绝启动并说明依据 |
 | `CompactionTest` | 手动/自动收拢前后语义一致；收拢后重复投递、失败重试、重启恢复均正常 |
+| `CrashMidCompactionRecoveryTest` | 收拢在“快照已替换、日志未清”时被杀→重启后拒绝计数/各状态数量/位点/查重口径与停机前一致；tmp 残留丢弃；旧格式拒绝帧+快照→拒绝启动；恢复后继续投递/消费/重试/再收拢正常 |
 
 ```bash
 mvn test                                  # 全部
@@ -214,6 +230,7 @@ mvn -Dtest=OffsetRejectTest test          # 单场景
 mvn -Dtest=PersistenceRestartTest test      # 完整重启恢复
 mvn -Dtest=CrashMidWriteRecoveryTest test  # 写一半被杀后的恢复
 mvn -Dtest=CompactionTest test            # 历史收拢
+mvn -Dtest=CrashMidCompactionRecoveryTest test  # 收拢中途被强杀后的重启一致性
 ```
 
 本地手动验证完整重启：
